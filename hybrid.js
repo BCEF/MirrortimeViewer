@@ -16,6 +16,7 @@ let cameras = [
 ];
 
 let camera = cameras[0];
+let currentCamera = camera;
 
 function createWorker(self) {
   let vertexCount = 0;
@@ -135,6 +136,14 @@ function createWorker(self) {
       ushort: "getUint16",
       uchar: "getUint8",
     };
+    let totalFrames = 0;
+    const framesMatch = /(?:frames|total_frames|total_frames:)\s+(\d+)/i.exec(header);
+    if (framesMatch) {
+      totalFrames = parseInt(framesMatch[1]);
+    }
+
+    let isTemporal = false;
+
     for (let prop of header
       .slice(0, header_end_index)
       .split("\n")
@@ -143,7 +152,8 @@ function createWorker(self) {
       const arrayType = TYPE_MAP[type] || "getInt8";
       types[name] = arrayType;
       offsets[name] = row_offset;
-      row_offset += parseInt(arrayType.replace(/[^\d]/g, "")) / 8;
+      row_offset += (parseInt(arrayType.replace(/[^\d]/g, "")) || 8) / 8;
+      if (name.includes("mu") || name.includes("motion") || name.includes("trbf") || name.includes("omega")) isTemporal = true;
     }
 
     console.log("Bytes per row", row_offset, types, offsets);
@@ -172,16 +182,12 @@ function createWorker(self) {
     }
     console.timeEnd("calculate importance");
 
-    for (let type in types) {
-      let min = Infinity,
-        max = -Infinity;
-      for (row = 0; row < vertexCount; row++) {
-        sizeIndex[row] = row;
-        min = Math.min(min, attrs[type]);
-        max = Math.max(max, attrs[type]);
-      }
-      console.log(type, min, max);
-    }
+    // Removed slow property logging loop for performance
+    console.log("Parsed Lifetime Parameters:", {
+      mu: !!(types.mu || types.lifetime_mu),
+      w: !!(types.w || types.lifetime_w),
+      k: !!(types.k || types.lifetime_k)
+    });
 
     console.time("sort");
     sizeIndex.sort((b, a) => sizeList[a] - sizeList[b]);
@@ -196,53 +202,73 @@ function createWorker(self) {
     var texdata_f = new Float32Array(texdata.buffer);
 
     console.time("build buffer");
-    for (let j = 0; j < vertexCount; j++) {
-      row = sizeIndex[j];
+    try {
+      for (let j = 0; j < vertexCount; j++) {
+        row = sizeIndex[j];
 
-      // x, y, z
-      position_buffer[3 * j + 0] = attrs.x;
-      position_buffer[3 * j + 1] = attrs.y;
-      position_buffer[3 * j + 2] = attrs.z;
+        // x, y, z
+        position_buffer[3 * j + 0] = attrs.x;
+        position_buffer[3 * j + 1] = attrs.y;
+        position_buffer[3 * j + 2] = attrs.z;
 
-      texdata_f[16 * j + 0] = attrs.x;
-      texdata_f[16 * j + 1] = attrs.y;
-      texdata_f[16 * j + 2] = attrs.z;
+        texdata_f[16 * j + 0] = attrs.x;
+        texdata_f[16 * j + 1] = attrs.y;
+        texdata_f[16 * j + 2] = attrs.z;
 
-      // quaternions
-      texdata[16 * j + 3] = packHalf2x16(attrs.rot_0, attrs.rot_1);
-      texdata[16 * j + 4] = packHalf2x16(attrs.rot_2, attrs.rot_3);
+        // quaternions
+        texdata[16 * j + 3] = packHalf2x16(attrs.rot_0, attrs.rot_1);
+        texdata[16 * j + 4] = packHalf2x16(attrs.rot_2, attrs.rot_3);
 
-      // scale
-      texdata[16 * j + 5] = packHalf2x16(Math.exp(attrs.scale_0), Math.exp(attrs.scale_1));
-      texdata[16 * j + 6] = packHalf2x16(Math.exp(attrs.scale_2), 0);
+        // scale
+        texdata[16 * j + 5] = packHalf2x16(Math.exp(attrs.scale_0), Math.exp(attrs.scale_1));
+        texdata[16 * j + 6] = packHalf2x16(Math.exp(attrs.scale_2), 0);
 
-      // rgb
-      texdata_c[4 * (16 * j + 7) + 0] = Math.max(0, Math.min(255, attrs.f_dc_0 * 255));
-      texdata_c[4 * (16 * j + 7) + 1] = Math.max(0, Math.min(255, attrs.f_dc_1 * 255));
-      texdata_c[4 * (16 * j + 7) + 2] = Math.max(0, Math.min(255, attrs.f_dc_2 * 255));
+        // rgb
+        const SH_C0 = 0.28209479177387814;
+        texdata_c[4 * (16 * j + 7) + 0] = Math.max(0, Math.min(255, (0.5 + SH_C0 * attrs.f_dc_0) * 255));
+        texdata_c[4 * (16 * j + 7) + 1] = Math.max(0, Math.min(255, (0.5 + SH_C0 * attrs.f_dc_1) * 255));
+        texdata_c[4 * (16 * j + 7) + 2] = Math.max(0, Math.min(255, (0.5 + SH_C0 * attrs.f_dc_2) * 255));
 
-      // opacity
-      texdata_c[4 * (16 * j + 7) + 3] = (1 / (1 + Math.exp(-attrs.opacity))) * 255;
+        // opacity
+        texdata_c[4 * (16 * j + 7) + 3] = (1 / (1 + Math.exp(-attrs.opacity))) * 255;
 
-      // movement over time
-      texdata[16 * j + 8 + 0] = packHalf2x16(attrs.motion_0, attrs.motion_1);
-      texdata[16 * j + 8 + 1] = packHalf2x16(attrs.motion_2, attrs.motion_3);
-      texdata[16 * j + 8 + 2] = packHalf2x16(attrs.motion_4, attrs.motion_5);
-      texdata[16 * j + 8 + 3] = packHalf2x16(attrs.motion_6, attrs.motion_7);
-      texdata[16 * j + 8 + 4] = packHalf2x16(attrs.motion_8, 0);
+        // movement over time
+        if (types.motion_0) {
+          texdata[16 * j + 8 + 0] = packHalf2x16(attrs.motion_0, attrs.motion_1);
+          texdata[16 * j + 8 + 1] = packHalf2x16(attrs.motion_2, attrs.motion_3);
+          texdata[16 * j + 8 + 2] = packHalf2x16(attrs.motion_4, attrs.motion_5);
+          texdata[16 * j + 8 + 3] = packHalf2x16(attrs.motion_6, attrs.motion_7);
+          texdata[16 * j + 8 + 4] = packHalf2x16(attrs.motion_8, 0);
+        }
 
-      // rotation over time
-      texdata[16 * j + 8 + 5] = packHalf2x16(attrs.omega_0, attrs.omega_1);
-      texdata[16 * j + 8 + 6] = packHalf2x16(attrs.omega_2, attrs.omega_3);
+        // rotation over time
+        if (types.omega_0) {
+          texdata[16 * j + 8 + 5] = packHalf2x16(attrs.omega_0, attrs.omega_1);
+          texdata[16 * j + 8 + 6] = packHalf2x16(attrs.omega_2, attrs.omega_3);
+        }
 
-      // trbf temporal radial basis function parameters
-      texdata[16 * j + 8 + 7] = packHalf2x16(attrs.trbf_center, Math.exp(attrs.trbf_scale));
+        // trbf temporal radial basis function parameters / lifetime
+        if (types.trbf_center) {
+          texdata[16 * j + 8 + 7] = packHalf2x16(attrs.trbf_center, Math.exp(attrs.trbf_scale));
+        } else if (types.mu || types.lifetime_mu) {
+          const mu = types.mu ? attrs.mu : attrs.lifetime_mu;
+          const w = types.w ? attrs.w : attrs.lifetime_w;
+          const k = types.k ? attrs.k : attrs.lifetime_k;
+          texdata[16 * j + 8 + 0] = packHalf2x16(mu, w);
+          texdata[16 * j + 8 + 1] = packHalf2x16(k, 0);
+          texdata[16 * j + 8 + 7] = packHalf2x16(-1.0, 0);
+        }
+      }
+    } catch (e) {
+      console.error("Error building buffer at vertex", row, e);
     }
     console.timeEnd("build buffer");
 
     console.log("Scene Bytes", texdata.buffer.byteLength);
+    console.log("Sending texdata to main thread. totalFrames:", totalFrames, "isTemporal:", isTemporal);
 
-    self.postMessage({ texdata, texwidth, texheight }, [texdata.buffer]);
+    self.postMessage({ texdata, texwidth, texheight, totalFrames, isTemporal, vertexCount }, [texdata.buffer]);
+    return vertexCount;
   }
 
   self.onmessage = (e) => {
@@ -250,10 +276,11 @@ function createWorker(self) {
       let texture = e.data.texture;
       vertexCount = Math.floor((texture.byteLength - e.data.remaining) / 4 / 16);
       positions = new Float32Array(vertexCount * 3);
+      let floatView = new Float32Array(texture.buffer);
       for (let i = 0; i < vertexCount; i++) {
-        positions[3 * i + 0] = texture[16 * i + 0];
-        positions[3 * i + 1] = texture[16 * i + 1];
-        positions[3 * i + 2] = texture[16 * i + 2];
+        positions[3 * i + 0] = floatView[16 * i + 0];
+        positions[3 * i + 1] = floatView[16 * i + 1];
+        positions[3 * i + 2] = floatView[16 * i + 2];
       }
       throttledSort();
     } else if (e.data.vertexCount) {
@@ -288,28 +315,47 @@ const vertexShaderSource = `
   void main () {
       gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
 
-      uvec4 motion1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 3u, uint(index) >> 10), 0);
-      vec2 trbf = unpackHalf2x16(motion1.w);
-      float dt = time - trbf.x;
-
-      float topacity = exp(-1.0 * pow(dt / trbf.y, 2.0));
-      if(topacity < 0.02) return;
-
-      uvec4 motion0 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 2u, uint(index) >> 10), 0);
       uvec4 static0 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2), uint(index) >> 10), 0);
+      uvec4 static1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 1u, uint(index) >> 10), 0);
+      uvec4 motion0 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 2u, uint(index) >> 10), 0);
+      uvec4 motion1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 3u, uint(index) >> 10), 0);
 
-      vec2 m0 = unpackHalf2x16(motion0.x), m1 = unpackHalf2x16(motion0.y), m2 = unpackHalf2x16(motion0.z), 
-           m3 = unpackHalf2x16(motion0.w), m4 = unpackHalf2x16(motion1.x); 
+      vec2 trbf = unpackHalf2x16(motion1.w);
+      float topacity = 1.0;
+      vec3 tpos = vec3(0.0);
+      vec4 trot = vec4(0.0);
+
+      if (trbf.x == -1.0) {
+        // 4D Sigmoid mode (mu, w, k)
+        vec2 mu_w = unpackHalf2x16(motion0.x);
+        vec2 k_params = unpackHalf2x16(motion0.y);
+        float mu = mu_w.x;
+        float w = abs(mu_w.y);
+        float k = abs(k_params.x);
+        
+        float left_sigmoid = 1.0 / (1.0 + exp(-k * (time - (mu - w))));
+        float right_sigmoid = 1.0 / (1.0 + exp(k * (time - (mu + w))));
+        topacity = left_sigmoid * right_sigmoid;
+      } else if (trbf.y > 0.0) {
+        // TRBF mode
+        float dt = time - trbf.x;
+        topacity = exp(-1.0 * pow(dt / trbf.y, 2.0));
+        float dt_motion = dt;
+
+        vec2 m0 = unpackHalf2x16(motion0.x), m1 = unpackHalf2x16(motion0.y), m2 = unpackHalf2x16(motion0.z), 
+             m3 = unpackHalf2x16(motion0.w), m4 = unpackHalf2x16(motion1.x); 
+        
+        trot = vec4(unpackHalf2x16(motion1.y).xy, unpackHalf2x16(motion1.z).xy) * dt_motion;
+        tpos = (vec3(m0.xy, m1.x) * dt_motion + vec3(m1.y, m2.xy) * dt_motion * dt_motion + vec3(m3.xy, m4.x) * dt_motion * dt_motion * dt_motion);
+      }
       
-      vec4 trot = vec4(unpackHalf2x16(motion1.y).xy, unpackHalf2x16(motion1.z).xy) * dt;
-      vec3 tpos = (vec3(m0.xy, m1.x) * dt + vec3(m1.y, m2.xy) * dt*dt + vec3(m3.xy, m4.x) * dt*dt*dt);
+      if(topacity < 0.02) return;
       
       vec4 cam = view * vec4(uintBitsToFloat(static0.xyz) + tpos, 1);
       vec4 pos = projection * cam;
   
       float clip = 1.2 * pos.w;
       if (pos.z < -clip || pos.x < -clip || pos.x > clip || pos.y < -clip || pos.y > clip) return;
-      uvec4 static1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 1u, uint(index) >> 10), 0);
 
       vec4 rot = vec4(unpackHalf2x16(static0.w).xy, unpackHalf2x16(static1.x).xy) + trot;
       vec3 scale = vec3(unpackHalf2x16(static1.y).xy, unpackHalf2x16(static1.z).x);
@@ -342,7 +388,6 @@ const vertexShaderSource = `
       
       uint rgba = static1.w;
       vColor = 
-        clamp(pos.z/pos.w+1.0, 0.0, 1.0) * 
         vec4(1.0, 1.0, 1.0, topacity) *
         vec4(
           (rgba) & 0xffu, 
@@ -378,16 +423,17 @@ const fragmentShaderSource = `
   
   `.trim();
 
-let defaultViewMatrix = [0.99, 0.01, -0.14, 0, 0.02, 0.99, 0.12, 0, 0.14, -0.12, 0.98, 0, -0.09, -0.26, 0.2, 1];
 
+let defaultViewMatrix = [0.99, 0.01, -0.14, 0, 0.02, 0.99, 0.12, 0, 0.14, -0.12, 0.98, 0, -0.09, -0.26, 0.2, 1];
 let viewMatrix = defaultViewMatrix;
+
 async function main() {
   let carousel = false;
   const params = new URLSearchParams(location.search);
   try {
     viewMatrix = JSON.parse(decodeURIComponent(location.hash.slice(1)));
     carousel = false;
-  } catch (err) {}
+  } catch (err) { }
 
   const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
   let splatData = new Uint8Array([]);
@@ -430,6 +476,9 @@ async function main() {
 
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(program));
 
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(program));
+
+
   gl.disable(gl.DEPTH_TEST); // Disable depth testing
 
   // Enable blending
@@ -437,21 +486,21 @@ async function main() {
   gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA, gl.ONE, gl.ONE_MINUS_DST_ALPHA, gl.ONE);
   gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
 
+  gl.useProgram(program);
+
   const u_projection = gl.getUniformLocation(program, "projection");
   const u_viewport = gl.getUniformLocation(program, "viewport");
   const u_focal = gl.getUniformLocation(program, "focal");
   const u_view = gl.getUniformLocation(program, "view");
   const u_time = gl.getUniformLocation(program, "time");
 
-  // positions
+  const a_position = gl.getAttribLocation(program, "position");
+  const a_index = gl.getAttribLocation(program, "index");
+
   const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
   const vertexBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, triangleVertices, gl.STATIC_DRAW);
-  const a_position = gl.getAttribLocation(program, "position");
-  gl.enableVertexAttribArray(a_position);
-  gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-  gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
 
   var texture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -460,16 +509,13 @@ async function main() {
   gl.uniform1i(u_textureLocation, 0);
 
   const indexBuffer = gl.createBuffer();
-  const a_index = gl.getAttribLocation(program, "index");
-  gl.enableVertexAttribArray(a_index);
-  gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
-  gl.vertexAttribIPointer(a_index, 1, gl.INT, false, 0, 0);
-  gl.vertexAttribDivisor(a_index, 1);
+  let indexDataLoaded = false;
 
   const resize = () => {
-    gl.uniform2fv(u_focal, new Float32Array([camera.fx, camera.fy]));
+    if (!currentCamera) currentCamera = cameras[0];
+    gl.uniform2fv(u_focal, new Float32Array([currentCamera.fx, currentCamera.fy]));
 
-    projectionMatrix = getProjectionMatrix(camera.fx, camera.fy, innerWidth, innerHeight);
+    projectionMatrix = getProjectionMatrix(currentCamera.fx, currentCamera.fy, innerWidth, innerHeight);
 
     gl.uniform2fv(u_viewport, new Float32Array([innerWidth, innerHeight]));
 
@@ -483,40 +529,84 @@ async function main() {
   window.addEventListener("resize", resize);
   resize();
 
+  let totalFrames = 0;
+  let isPlaying = true;
+  let currentTime = 0;
+
+  const timeline = document.getElementById("timeline");
+  const playPauseBtn = document.getElementById("play-pause");
+  const timeDisplay = document.getElementById("time-display");
+  const controls = document.getElementById("controls");
+  const speedSlider = document.getElementById("speed-slider");
+  const speedDisplay = document.getElementById("speed-value");
+
+  let playbackSpeed = 1.0;
+
+  if (speedSlider) {
+    speedSlider.oninput = () => {
+      playbackSpeed = parseFloat(speedSlider.value);
+      speedDisplay.innerText = playbackSpeed.toFixed(1) + "x";
+    };
+  }
+
+  playPauseBtn.onclick = () => {
+    isPlaying = !isPlaying;
+    playPauseBtn.innerText = isPlaying ? "Pause" : "Play";
+  };
+
+  timeline.oninput = () => {
+    currentTime = parseFloat(timeline.value) * totalFrames;
+    isPlaying = false;
+    playPauseBtn.innerText = "Play";
+  };
+
+
+
   worker.onmessage = (e) => {
     if (e.data.texdata) {
       const { texdata, texwidth, texheight } = e.data;
+      vertexCount = texdata.byteLength / 4 / 16;
+      console.log("Main thread received texdata. vertexCount:", vertexCount, "totalFrames:", e.data.totalFrames);
 
-      const json = new TextEncoder().encode(
-        JSON.stringify([
-          {
-            type: "splat",
-            size: texdata.byteLength,
-            texwidth: texwidth,
-            texheight: texheight,
-            cameras: cameras,
-          },
-        ])
-      );
-      const magic = new Uint32Array(2);
-      magic[0] = 0x674b;
-      magic[1] = json.length;
-      const blob = new Blob([magic.buffer, json.buffer, texdata.buffer], {
-        type: "application/octet-stream",
-      });
+      // Improved 4D detection and reset logic
+      let receivedTotalFrames = e.data.totalFrames;
+      const isTemporal = e.data.isTemporal || (receivedTotalFrames !== undefined && receivedTotalFrames > 0);
 
-      readChunks(new Response(blob).body.getReader(), [{ size: 8, type: "magic" }], chunkHandler);
+      if (isTemporal) {
+        if (receivedTotalFrames !== undefined && receivedTotalFrames > 0) {
+          totalFrames = receivedTotalFrames;
+        } else if (totalFrames === 0) {
+          totalFrames = 100.0; // Default to 100 frames if unknown
+        }
+        console.log("Temporal data detected. totalFrames: " + totalFrames + ". Enabling 4D controls.");
+        controls.style.display = "flex";
+        document.querySelectorAll(".four-d-only").forEach(el => {
+          el.classList.remove("hidden");
+        });
+      } else {
+        console.log("No temporal data detected. Hiding 4D controls.");
+        totalFrames = 0;
+        controls.style.display = "none";
+        document.querySelectorAll(".four-d-only").forEach(el => {
+          el.classList.add("hidden");
+        });
+      }
 
-      const link = document.createElement("a");
-      link.download = "model.splatv";
-      link.href = URL.createObjectURL(blob);
-      document.body.appendChild(link);
-      link.click();
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, texwidth, texheight, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, texdata);
+
+      worker.postMessage({ texture: texdata, remaining: 0 }, [texdata.buffer]);
     } else if (e.data.depthIndex) {
       const { depthIndex, viewProj } = e.data;
       gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
-      vertexCount = e.data.vertexCount;
+      indexDataLoaded = true;
+      if (e.data.vertexCount) vertexCount = e.data.vertexCount;
     }
   };
 
@@ -529,18 +619,19 @@ async function main() {
     if (!activeKeys.includes(e.code)) activeKeys.push(e.code);
     if (/\d/.test(e.key)) {
       currentCameraIndex = parseInt(e.key);
-      camera = cameras[currentCameraIndex];
-      viewMatrix = getViewMatrix(camera);
+      currentCamera = cameras[currentCameraIndex];
+      viewMatrix = getViewMatrix(currentCamera);
     }
     if (["-", "_"].includes(e.key)) {
       currentCameraIndex = (currentCameraIndex + cameras.length - 1) % cameras.length;
-      viewMatrix = getViewMatrix(cameras[currentCameraIndex]);
+      currentCamera = cameras[currentCameraIndex];
+      viewMatrix = getViewMatrix(currentCamera);
     }
     if (["+", "="].includes(e.key)) {
       currentCameraIndex = (currentCameraIndex + 1) % cameras.length;
-      viewMatrix = getViewMatrix(cameras[currentCameraIndex]);
+      currentCamera = cameras[currentCameraIndex];
+      viewMatrix = getViewMatrix(currentCamera);
     }
-    // camid.innerText = "cam  " + currentCameraIndex;
     if (e.code == "KeyV") {
       location.hash = "#" + JSON.stringify(viewMatrix.map((k) => Math.round(k * 100) / 100));
       //   camid.innerText = "";
@@ -561,17 +652,12 @@ async function main() {
     (e) => {
       carousel = false;
       e.preventDefault();
-      const lineHeight = 10;
-      const scale = e.deltaMode == 1 ? lineHeight : e.deltaMode == 2 ? innerHeight : 1;
+      const scale = 1;
       let inv = invert4(viewMatrix);
       if (e.shiftKey) {
         inv = translate4(inv, (e.deltaX * scale) / innerWidth, (e.deltaY * scale) / innerHeight, 0);
       } else if (e.ctrlKey || e.metaKey) {
-        // inv = rotate4(inv,  (e.deltaX * scale) / innerWidth,  0, 0, 1);
-        // inv = translate4(inv,  0, (e.deltaY * scale) / innerHeight, 0);
-        // let preY = inv[13];
         inv = translate4(inv, 0, 0, (-10 * (e.deltaY * scale)) / innerHeight);
-        // inv[13] = preY;
       } else {
         let d = 4;
         inv = translate4(inv, 0, 0, d);
@@ -579,7 +665,6 @@ async function main() {
         inv = rotate4(inv, (e.deltaY * scale) / innerHeight, 1, 0, 0);
         inv = translate4(inv, 0, 0, -d);
       }
-
       viewMatrix = invert4(inv);
     },
     { passive: false }
@@ -593,13 +678,9 @@ async function main() {
     startY = e.clientY;
     down = e.ctrlKey || e.metaKey ? 2 : 1;
   });
+
   canvas.addEventListener("contextmenu", (e) => {
-    // console.log("contextmenu?");
-    // carousel = false;
     e.preventDefault();
-    // startX = e.clientX;
-    // startY = e.clientY;
-    // down = 2;
   });
 
   canvas.addEventListener("mousemove", (e) => {
@@ -609,26 +690,19 @@ async function main() {
       let dx = (5 * (e.clientX - startX)) / innerWidth;
       let dy = (5 * (e.clientY - startY)) / innerHeight;
       let d = 4;
-
       inv = translate4(inv, 0, 0, d);
       inv = rotate4(inv, dx, 0, 1, 0);
       inv = rotate4(inv, -dy, 1, 0, 0);
       inv = translate4(inv, 0, 0, -d);
-      // let postAngle = Math.atan2(inv[0], inv[10])
-      // inv = rotate4(inv, postAngle - preAngle, 0, 0, 1)
-      // console.log(postAngle)
       viewMatrix = invert4(inv);
-
       startX = e.clientX;
       startY = e.clientY;
     } else if (down == 2) {
       let inv = invert4(viewMatrix);
-      // inv = rotateY(inv, );
-      // let preY = inv[13];
-      inv = translate4(inv, (-10 * (e.clientX - startX)) / innerWidth, 0, (10 * (e.clientY - startY)) / innerHeight);
-      // inv[13] = preY;
+      let dx = (e.clientX - startX) / innerWidth;
+      let dy = (e.clientY - startY) / innerHeight;
+      inv = translate4(inv, dx * 4, -dy * 4, 0);
       viewMatrix = invert4(inv);
-
       startX = e.clientX;
       startY = e.clientY;
     }
@@ -668,42 +742,25 @@ async function main() {
     (e) => {
       e.preventDefault();
       if (e.touches.length === 1 && down) {
+        let dx = (e.touches[0].clientX - startX) / innerWidth;
+        let dy = (e.touches[0].clientY - startY) / innerHeight;
         let inv = invert4(viewMatrix);
-        let dx = (4 * (e.touches[0].clientX - startX)) / innerWidth;
-        let dy = (4 * (e.touches[0].clientY - startY)) / innerHeight;
-
         let d = 4;
         inv = translate4(inv, 0, 0, d);
-        // inv = translate4(inv,  -x, -y, -z);
-        // inv = translate4(inv,  x, y, z);
-        inv = rotate4(inv, dx, 0, 1, 0);
-        inv = rotate4(inv, -dy, 1, 0, 0);
+        inv = rotate4(inv, dx * 5, 0, 1, 0);
+        inv = rotate4(inv, -dy * 5, 1, 0, 0);
         inv = translate4(inv, 0, 0, -d);
-
         viewMatrix = invert4(inv);
-
         startX = e.touches[0].clientX;
         startY = e.touches[0].clientY;
       } else if (e.touches.length === 2) {
-        // alert('beep')
-        const dtheta =
-          Math.atan2(startY - altY, startX - altX) -
-          Math.atan2(e.touches[0].clientY - e.touches[1].clientY, e.touches[0].clientX - e.touches[1].clientX);
-        const dscale =
-          Math.hypot(startX - altX, startY - altY) /
-          Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+        const dscale = Math.hypot(startX - altX, startY - altY) / Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
         const dx = (e.touches[0].clientX + e.touches[1].clientX - (startX + altX)) / 2;
         const dy = (e.touches[0].clientY + e.touches[1].clientY - (startY + altY)) / 2;
+
         let inv = invert4(viewMatrix);
-        // inv = translate4(inv,  0, 0, d);
-        inv = rotate4(inv, dtheta, 0, 0, 1);
-
-        inv = translate4(inv, -dx / innerWidth, -dy / innerHeight, 0);
-
-        // let preY = inv[13];
-        inv = translate4(inv, 0, 0, 3 * (1 - dscale));
-        // inv[13] = preY;
-
+        inv = translate4(inv, dx / innerWidth * 10, -dy / innerHeight * 10, 0);
+        inv = translate4(inv, 0, 0, 10 * (dscale - 1));
         viewMatrix = invert4(inv);
 
         startX = e.touches[0].clientX;
@@ -728,13 +785,13 @@ async function main() {
   let jumpDelta = 0;
   let vertexCount = 0;
 
-  let lastFrame = 0;
+  let lastFrame = performance.now();
   let avgFps = 0;
-  let start = 0;
+  let start = Date.now();
 
   window.addEventListener("gamepadconnected", (e) => {
     const gp = navigator.getGamepads()[e.gamepad.index];
-    console.log(`Gamepad connected at index ${gp.index}: ${gp.id}. It has ${gp.buttons.length} buttons and ${gp.axes.length} axes.`);
+    console.log("Gamepad connected at index " + gp.index + ": " + gp.id + ". It has " + gp.buttons.length + " buttons and " + gp.axes.length + " axes.");
   });
   window.addEventListener("gamepaddisconnected", (e) => {
     console.log("Gamepad disconnected");
@@ -743,57 +800,61 @@ async function main() {
   let leftGamepadTrigger, rightGamepadTrigger;
 
   const frame = (now) => {
+    if (!now) now = performance.now();
     let inv = invert4(viewMatrix);
     let shiftKey = activeKeys.includes("Shift") || activeKeys.includes("ShiftLeft") || activeKeys.includes("ShiftRight");
 
-    if (activeKeys.includes("ArrowUp")) {
+    if (activeKeys.includes("ArrowUp") || activeKeys.includes("KeyW")) {
       if (shiftKey) {
         inv = translate4(inv, 0, -0.03, 0);
       } else {
         inv = translate4(inv, 0, 0, 0.1);
       }
     }
-    if (activeKeys.includes("ArrowDown")) {
+    if (activeKeys.includes("ArrowDown") || activeKeys.includes("KeyS")) {
       if (shiftKey) {
         inv = translate4(inv, 0, 0.03, 0);
       } else {
         inv = translate4(inv, 0, 0, -0.1);
       }
     }
-    if (activeKeys.includes("ArrowLeft")) inv = translate4(inv, -0.03, 0, 0);
-    //
-    if (activeKeys.includes("ArrowRight")) inv = translate4(inv, 0.03, 0, 0);
-    // inv = rotate4(inv, 0.01, 0, 1, 0);
-    if (activeKeys.includes("KeyA")) inv = rotate4(inv, -0.01, 0, 1, 0);
-    if (activeKeys.includes("KeyD")) inv = rotate4(inv, 0.01, 0, 1, 0);
-    if (activeKeys.includes("KeyQ")) inv = rotate4(inv, 0.01, 0, 0, 1);
-    if (activeKeys.includes("KeyE")) inv = rotate4(inv, -0.01, 0, 0, 1);
-    if (activeKeys.includes("KeyW")) inv = rotate4(inv, 0.005, 1, 0, 0);
-    if (activeKeys.includes("KeyS")) inv = rotate4(inv, -0.005, 1, 0, 0);
+    if (activeKeys.includes("ArrowLeft") || activeKeys.includes("KeyA")) {
+      if (shiftKey) {
+        inv = rotate4(inv, 0.01, 0, 0, 1);
+      } else {
+        inv = translate4(inv, -0.03, 0, 0);
+      }
+    }
+    if (activeKeys.includes("ArrowRight") || activeKeys.includes("KeyD")) {
+      if (shiftKey) {
+        inv = rotate4(inv, -0.01, 0, 0, 1);
+      } else {
+        inv = translate4(inv, 0.03, 0, 0);
+      }
+    }
+    if (activeKeys.includes("KeyQ")) inv = rotate4(inv, 0.01, 0, 1, 0);
+    if (activeKeys.includes("KeyE")) inv = rotate4(inv, -0.01, 0, 1, 0);
     if (activeKeys.includes("BracketLeft")) {
-      camera.fx /= 1.01;
-      camera.fy /= 1.01;
+      currentCamera.fx /= 1.01;
+      currentCamera.fy /= 1.01;
       inv = translate4(inv, 0, 0, 0.1);
       resize();
     }
     if (activeKeys.includes("BracketRight")) {
-      camera.fx *= 1.01;
-      camera.fy *= 1.01;
+      currentCamera.fx *= 1.01;
+      currentCamera.fy *= 1.01;
       inv = translate4(inv, 0, 0, -0.1);
       resize();
     }
-    // console.log(activeKeys);
 
     const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
     let isJumping = activeKeys.includes("Space");
     for (let gamepad of gamepads) {
       if (!gamepad) continue;
 
-      const axisThreshold = 0.1; // Threshold to detect when the axis is intentionally moved
+      const axisThreshold = 0.1;
       const moveSpeed = 0.06;
-      const rotateSpeed = 0.02;
 
-      // Assuming the left stick controls translation (axes 0 and 1)
       if (Math.abs(gamepad.axes[0]) > axisThreshold) {
         inv = translate4(inv, moveSpeed * gamepad.axes[0], 0, 0);
         carousel = false;
@@ -806,35 +867,16 @@ async function main() {
         inv = translate4(inv, 0, -moveSpeed * (gamepad.buttons[12].pressed - gamepad.buttons[13].pressed), 0);
         carousel = false;
       }
-
-      if (gamepad.buttons[14].pressed || gamepad.buttons[15].pressed) {
-        inv = translate4(inv, -moveSpeed * (gamepad.buttons[14].pressed - gamepad.buttons[15].pressed), 0, 0);
-        carousel = false;
-      }
-
-      // Assuming the right stick controls rotation (axes 2 and 3)
-      if (Math.abs(gamepad.axes[2]) > axisThreshold) {
-        inv = rotate4(inv, rotateSpeed * gamepad.axes[2], 0, 1, 0);
-        carousel = false;
-      }
-      if (Math.abs(gamepad.axes[3]) > axisThreshold) {
-        inv = rotate4(inv, -rotateSpeed * gamepad.axes[3], 1, 0, 0);
-        carousel = false;
-      }
-
-      let tiltAxis = gamepad.buttons[6].value - gamepad.buttons[7].value;
-      if (Math.abs(tiltAxis) > axisThreshold) {
-        inv = rotate4(inv, rotateSpeed * tiltAxis, 0, 0, 1);
-        carousel = false;
-      }
       if (gamepad.buttons[4].pressed && !leftGamepadTrigger) {
-        camera = cameras[(cameras.indexOf(camera) + 1) % cameras.length];
-        inv = invert4(getViewMatrix(camera));
+        currentCameraIndex = (currentCameraIndex + 1) % cameras.length;
+        currentCamera = cameras[currentCameraIndex];
+        inv = invert4(getViewMatrix(currentCamera));
         carousel = false;
       }
       if (gamepad.buttons[5].pressed && !rightGamepadTrigger) {
-        camera = cameras[(cameras.indexOf(camera) + cameras.length - 1) % cameras.length];
-        inv = invert4(getViewMatrix(camera));
+        currentCameraIndex = (currentCameraIndex + cameras.length - 1) % cameras.length;
+        currentCamera = cameras[currentCameraIndex];
+        inv = invert4(getViewMatrix(currentCamera));
         carousel = false;
       }
       leftGamepadTrigger = gamepad.buttons[4].pressed;
@@ -857,7 +899,6 @@ async function main() {
     }
 
     viewMatrix = invert4(inv);
-
     if (carousel) {
       let inv = invert4(defaultViewMatrix);
 
@@ -888,15 +929,43 @@ async function main() {
     if (vertexCount > 0) {
       document.getElementById("spinner").style.display = "none";
       gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
-      gl.uniform1f(u_time, Math.sin(Date.now() / 1000) / 2 + 1 / 2);
+
+      if (totalFrames > 0) {
+        if (isPlaying) {
+          const delta = (now - lastFrame) / 1000;
+          currentTime = (currentTime + delta * 30 * playbackSpeed) % totalFrames;
+        }
+        gl.uniform1f(u_time, currentTime);
+        timeline.value = (currentTime / totalFrames).toString();
+        timeDisplay.innerText = currentTime.toFixed(2) + " / " + totalFrames.toFixed(2);
+        if (Math.random() < 0.01) console.log("Playback Status:", { currentTime, totalFrames, isPlaying, playbackSpeed });
+      } else {
+        gl.uniform1f(u_time, Math.sin(Date.now() / 1000) / 2 + 1 / 2);
+      }
 
       gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
-    } else {
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      document.getElementById("spinner").style.display = "";
-      start = Date.now() + 2000;
+
+      if (indexDataLoaded) {
+        gl.useProgram(program);
+        gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
+
+        gl.enableVertexAttribArray(a_position);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+        gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+        gl.vertexAttribDivisor(a_position, 0);
+
+        gl.enableVertexAttribArray(a_index);
+        gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+        gl.vertexAttribIPointer(a_index, 1, gl.INT, 0, 0);
+        gl.vertexAttribDivisor(a_index, 1);
+
+        gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+
+        gl.disableVertexAttribArray(a_index);
+        gl.vertexAttribDivisor(a_index, 0);
+      }
     }
+
     const progress = (100 * vertexCount) / (splatData.length / rowLength);
     if (progress < 100) {
       document.getElementById("progress").style.width = progress + "%";
@@ -908,15 +977,21 @@ async function main() {
     requestAnimationFrame(frame);
   };
 
-  frame();
+  frame(performance.now());
 
   const selectFile = (file) => {
+    currentTime = 0;
+    totalFrames = 0;
+    isPlaying = true;
+    if (playPauseBtn) playPauseBtn.innerText = "Pause";
+
     const fr = new FileReader();
     if (/\.json$/i.test(file.name)) {
       fr.onload = () => {
         cameras = JSON.parse(fr.result);
-        viewMatrix = getViewMatrix(cameras[0]);
-        projectionMatrix = getProjectionMatrix(camera.fx / downsample, camera.fy / downsample, canvas.width, canvas.height);
+        currentCamera = cameras[0];
+        viewMatrix = getViewMatrix(currentCamera);
+        projectionMatrix = getProjectionMatrix(currentCamera.fx / downsample, currentCamera.fy / downsample, canvas.width, canvas.height);
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
 
         console.log("Loaded Cameras");
@@ -935,8 +1010,8 @@ async function main() {
           // splatv file
           readChunks(new Response(splatData).body.getReader(), [{ size: 8, type: "magic" }], chunkHandler).then(() => {
             currentCameraIndex = 0;
-            camera = cameras[currentCameraIndex];
-            viewMatrix = getViewMatrix(camera);
+            currentCamera = cameras[currentCameraIndex];
+            viewMatrix = getViewMatrix(currentCamera);
           });
         } else {
           alert("Unsupported file format!");
@@ -950,7 +1025,7 @@ async function main() {
     try {
       viewMatrix = JSON.parse(decodeURIComponent(location.hash.slice(1)));
       carousel = false;
-    } catch (err) {}
+    } catch (err) { }
   });
 
   const preventDefault = (e) => {
@@ -966,47 +1041,13 @@ async function main() {
     selectFile(e.dataTransfer.files[0]);
   });
 
-  let lastVertexCount = -1;
-  const chunkHandler = (chunk, buffer, remaining, chunks) => {
-    if (!remaining && chunk.type === "magic") {
-      let intView = new Uint32Array(buffer);
-      if (intView[0] !== 0x674b) throw new Error("This does not look like a splatv file");
-      chunks.push({ size: intView[1], type: "chunks" });
-    } else if (!remaining && chunk.type === "chunks") {
-      for (let chunk of JSON.parse(new TextDecoder("utf-8").decode(buffer))) {
-        chunks.push(chunk);
-        if (chunk.type === "splat") {
-          cameras = chunk.cameras;
-          camera = chunk.cameras[0];
-          resize();
-        }
-      }
-    } else if (chunk.type === "splat") {
-      if (vertexCount > lastVertexCount || remaining === 0) {
-        lastVertexCount = vertexCount;
-        worker.postMessage({ texture: new Float32Array(buffer), remaining: remaining });
-        console.log("splat", remaining);
-
-        const texdata = new Uint32Array(buffer);
-        // console.log(texdata);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, chunk.texwidth, chunk.texheight, 0, gl.RGBA_INTEGER, gl.UNSIGNED_INT, texdata);
-      }
-    } else if (!remaining) {
-      console.log("chunk", chunk, buffer);
-    }
+  const fetchPly = async (url) => {
+    const response = await fetch(url);
+    const content = await response.arrayBuffer();
+    worker.postMessage({ ply: content }, [content]);
   };
 
-  const url = params.get("url") ? new URL(params.get("url"), "https://huggingface.co/cakewalk/splat-data/resolve/main/") : "model.splatv";
-  const req = await fetch(url, { mode: "cors", credentials: "omit" });
-  if (req.status != 200) throw new Error(req.status + " Unable to load " + req.url);
-
-  await readChunks(req.body.getReader(), [{ size: 8, type: "magic" }], chunkHandler);
+  fetchPly("point_cloud_4d.ply");
 }
 
 main().catch((err) => {
